@@ -67,6 +67,10 @@ static const int desired_video_buffers = 256;
  */
 #define V4L_TS_CONVERT_READY V4L_TS_DEFAULT
 
+
+enum { NO_V4L2_BUF_ON,NO_V4L2_BUF_OFF };
+
+
 struct video_data {
     AVClass *class;
     int fd;
@@ -76,6 +80,8 @@ struct video_data {
     int interlaced;
     int top_field_first;
     int ts_mode;
+    int no_v4l2_buf_counter;
+    int no_v4l2_buf_set;
     TimeFilter *timefilter;
     int64_t last_time_m;
 
@@ -90,6 +96,7 @@ struct video_data {
     int list_format;    /**< Set by a private option. */
     int list_standard;  /**< Set by a private option. */
     char *framerate;    /**< Set by a private option. */
+    int no_v4l2_buf_threshold;    /**< Set by a private option. */
 
     int use_libv4l2;
     int (*open_f)(const char *file, int oflag, ...);
@@ -223,6 +230,15 @@ static int device_init(AVFormatContext *ctx, int *width, int *height,
                "The V4L2 driver is using the interlaced mode\n");
         s->interlaced = 1;
     }
+
+    s->no_v4l2_buf_set = NO_V4L2_BUF_OFF;
+
+    if (s->no_v4l2_buf_threshold) {
+        av_log(ctx, AV_LOG_DEBUG,
+               "No V4L2 dequeued buffer threshold (signal-loss protection) set to %d\n",s->no_v4l2_buf_threshold);
+        s->no_v4l2_buf_counter = 0;
+    }
+
 
     return res;
 }
@@ -496,16 +512,32 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
 
     pkt->size = 0;
 
-    /* FIXME: Some special treatment might be needed in case of loss of signal... */
+    if ( (s->no_v4l2_buf_set == NO_V4L2_BUF_ON) && (s->no_v4l2_buf_counter >= s->no_v4l2_buf_threshold)) {
+        av_log(ctx, AV_LOG_ERROR, "No v4l2 buffer was available to dequeue for more than %d times.\n",s->no_v4l2_buf_threshold);
+        return AVERROR(EPIPE);
+    }
+
     while ((res = v4l2_ioctl(s->fd, VIDIOC_DQBUF, &buf)) < 0 && (errno == EINTR));
     if (res < 0) {
-        if (errno == EAGAIN)
+        if (errno == EAGAIN) {
+            if (s->no_v4l2_buf_set == NO_V4L2_BUF_ON) {
+                s->no_v4l2_buf_counter++;
+            }
             return AVERROR(EAGAIN);
+        }
 
         res = AVERROR(errno);
         av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_DQBUF): %s\n",
                av_err2str(res));
         return res;
+    }
+
+    if (s->no_v4l2_buf_threshold) {
+        if (s->no_v4l2_buf_set == NO_V4L2_BUF_OFF) {
+            av_log(ctx, AV_LOG_DEBUG, "First V4L2 dequeued buffer received, activating signal-loss protection.\n");
+            s->no_v4l2_buf_set = NO_V4L2_BUF_ON;
+        }
+        s->no_v4l2_buf_counter = 0;
     }
 
     if (buf.index >= s->buffers) {
@@ -521,6 +553,8 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
         av_log(ctx, AV_LOG_WARNING,
                "Dequeued v4l2 buffer contains corrupted data (%d bytes).\n",
                buf.bytesused);
+        s->no_v4l2_buf_set = NO_V4L2_BUF_OFF;
+        av_log(ctx, AV_LOG_DEBUG, "deactivating signal-loss protection.\n");
         buf.bytesused = 0;
     } else
 #endif
@@ -1097,7 +1131,7 @@ static const AVOption options[] = {
     { "pixel_format", "set preferred pixel format",                               OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
     { "input_format", "set preferred pixel format (for raw video) or codec name", OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
     { "framerate",    "set frame rate",                                           OFFSET(framerate),    AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
-
+    { "no_v4l2_buf_threshold", "set no v4l2 dequeued buffer threshold",           OFFSET(no_v4l2_buf_threshold),    AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, DEC },
     { "list_formats", "list available formats and exit",                          OFFSET(list_format),  AV_OPT_TYPE_INT,    {.i64 = 0 },  0, INT_MAX, DEC, "list_formats" },
     { "all",          "show all available formats",                               OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_ALLFORMATS  },    0, INT_MAX, DEC, "list_formats" },
     { "raw",          "show only non-compressed formats",                         OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_RAWFORMATS  },    0, INT_MAX, DEC, "list_formats" },
