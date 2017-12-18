@@ -67,6 +67,12 @@ static const int desired_video_buffers = 256;
  */
 #define V4L_TS_CONVERT_READY V4L_TS_DEFAULT
 
+/**
+ * Signal loss fail-safe definitions
+ */
+#define NO_V4L2_BUF_FAILESAFE_TRIGGER_DEFAULT 1000
+enum { NO_V4L2_BUF_FAILSAFE_ON,NO_V4L2_BUF_FAILSAFE_OFF };
+
 struct video_data {
     AVClass *class;
     int fd;
@@ -76,6 +82,9 @@ struct video_data {
     int interlaced;
     int top_field_first;
     int ts_mode;
+    int v4l2_buf_dequeue_success_counter;
+    int v4l2_buf_dequeue_error_counter;
+    int no_v4l2_buf_failsafe_set;
     TimeFilter *timefilter;
     int64_t last_time_m;
 
@@ -86,10 +95,12 @@ struct video_data {
     char *standard;
     v4l2_std_id std_id;
     int channel;
-    char *pixel_format; /**< Set by a private option. */
-    int list_format;    /**< Set by a private option. */
-    int list_standard;  /**< Set by a private option. */
-    char *framerate;    /**< Set by a private option. */
+    char *pixel_format;                 /**< Set by a private option. */
+    int list_format;                    /**< Set by a private option. */
+    int list_standard;                  /**< Set by a private option. */
+    char *framerate;                    /**< Set by a private option. */
+    int no_v4l2_buf_failsafe_threshold; /**< Set by a private option. */
+    int no_v4l2_buf_failsafe_trigger;   /**< Set by a private option. */
 
     int use_libv4l2;
     int (*open_f)(const char *file, int oflag, ...);
@@ -223,6 +234,16 @@ static int device_init(AVFormatContext *ctx, int *width, int *height,
                "The V4L2 driver is using the interlaced mode\n");
         s->interlaced = 1;
     }
+
+    s->no_v4l2_buf_failsafe_set = NO_V4L2_BUF_FAILSAFE_OFF;
+
+    if (s->no_v4l2_buf_failsafe_threshold) {
+        av_log(ctx, AV_LOG_DEBUG,
+               "No V4L2 dequeued buffer failsafe (signal-loss protection) threshold set to %d\n",
+               s->no_v4l2_buf_failsafe_threshold);
+        s->v4l2_buf_dequeue_success_counter = s->v4l2_buf_dequeue_error_counter = 0;
+    }
+
 
     return res;
 }
@@ -497,11 +518,21 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
 
     pkt->size = 0;
 
-    /* FIXME: Some special treatment might be needed in case of loss of signal... */
+    if ((s->no_v4l2_buf_failsafe_set == NO_V4L2_BUF_FAILSAFE_ON) &&
+        (s->v4l2_buf_dequeue_error_counter >= s->no_v4l2_buf_failsafe_threshold)) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to dequeue v4l2 buffers for more than %d times.\n",
+               s->no_v4l2_buf_failsafe_threshold);
+        return AVERROR(EPIPE);
+    }
+
     while ((res = v4l2_ioctl(s->fd, VIDIOC_DQBUF, &buf)) < 0 && (errno == EINTR));
     if (res < 0) {
-        if (errno == EAGAIN)
+        if (errno == EAGAIN) {
+            if (s->no_v4l2_buf_failsafe_set == NO_V4L2_BUF_FAILSAFE_ON) {
+                s->v4l2_buf_dequeue_error_counter++;
+            }
             return AVERROR(EAGAIN);
+        }
 
         res = AVERROR(errno);
         av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_DQBUF): %s\n",
@@ -540,6 +571,18 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
             enqueue_buffer(s, &buf);
             return AVERROR_INVALIDDATA;
         }
+    }
+
+    /* Dequeued V4L2 buffer can be considered valid at this point */
+    if (s->no_v4l2_buf_failsafe_threshold) {
+        if (s->no_v4l2_buf_failsafe_set == NO_V4L2_BUF_FAILSAFE_OFF &&
+            s->v4l2_buf_dequeue_success_counter++ >= s->no_v4l2_buf_failsafe_trigger) {
+            av_log(ctx, AV_LOG_DEBUG,
+                   "Dequeued v4L2 buffers successfully %d times, activating fail-safe (signal-loss protection).\n",
+                   s->no_v4l2_buf_failsafe_trigger);
+            s->no_v4l2_buf_failsafe_set = NO_V4L2_BUF_FAILSAFE_ON;
+        }
+        s->v4l2_buf_dequeue_error_counter = 0;
     }
 
     /* Image is at s->buff_start[buf.index] */
@@ -1094,27 +1137,26 @@ static int v4l2_get_device_list(AVFormatContext *ctx, AVDeviceInfoList *device_l
 #define DEC AV_OPT_FLAG_DECODING_PARAM
 
 static const AVOption options[] = {
-    { "standard",     "set TV standard, used only by analog frame grabber",       OFFSET(standard),     AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0,       DEC },
-    { "channel",      "set TV channel, used only by frame grabber",               OFFSET(channel),      AV_OPT_TYPE_INT,    {.i64 = -1 },  -1, INT_MAX, DEC },
-    { "video_size",   "set frame size",                                           OFFSET(width),        AV_OPT_TYPE_IMAGE_SIZE, {.str = NULL},  0, 0,   DEC },
-    { "pixel_format", "set preferred pixel format",                               OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
-    { "input_format", "set preferred pixel format (for raw video) or codec name", OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
-    { "framerate",    "set frame rate",                                           OFFSET(framerate),    AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
-
-    { "list_formats", "list available formats and exit",                          OFFSET(list_format),  AV_OPT_TYPE_INT,    {.i64 = 0 },  0, INT_MAX, DEC, "list_formats" },
-    { "all",          "show all available formats",                               OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_ALLFORMATS  },    0, INT_MAX, DEC, "list_formats" },
-    { "raw",          "show only non-compressed formats",                         OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_RAWFORMATS  },    0, INT_MAX, DEC, "list_formats" },
-    { "compressed",   "show only compressed formats",                             OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_COMPFORMATS },    0, INT_MAX, DEC, "list_formats" },
-
-    { "list_standards", "list supported standards and exit",                      OFFSET(list_standard), AV_OPT_TYPE_INT,   {.i64 = 0 },  0, 1, DEC, "list_standards" },
-    { "all",            "show all supported standards",                           OFFSET(list_standard), AV_OPT_TYPE_CONST, {.i64 = 1 },  0, 0, DEC, "list_standards" },
-
-    { "timestamps",   "set type of timestamps for grabbed frames",                OFFSET(ts_mode),      AV_OPT_TYPE_INT,    {.i64 = 0 }, 0, 2, DEC, "timestamps" },
-    { "ts",           "set type of timestamps for grabbed frames",                OFFSET(ts_mode),      AV_OPT_TYPE_INT,    {.i64 = 0 }, 0, 2, DEC, "timestamps" },
-    { "default",      "use timestamps from the kernel",                           OFFSET(ts_mode),      AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_DEFAULT  }, 0, 2, DEC, "timestamps" },
-    { "abs",          "use absolute timestamps (wall clock)",                     OFFSET(ts_mode),      AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_ABS      }, 0, 2, DEC, "timestamps" },
-    { "mono2abs",     "force conversion from monotonic to absolute timestamps",   OFFSET(ts_mode),      AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_MONO2ABS }, 0, 2, DEC, "timestamps" },
-    { "use_libv4l2",  "use libv4l2 (v4l-utils) conversion functions",             OFFSET(use_libv4l2),  AV_OPT_TYPE_BOOL,   {.i64 = 0}, 0, 1, DEC },
+    { "standard",     "set TV standard, used only by analog frame grabber",                         OFFSET(standard),                       AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0,       DEC },
+    { "channel",      "set TV channel, used only by frame grabber",                                 OFFSET(channel),                        AV_OPT_TYPE_INT,    {.i64 = -1 },  -1, INT_MAX, DEC },
+    { "video_size",   "set frame size",                                                             OFFSET(width),                          AV_OPT_TYPE_IMAGE_SIZE, {.str = NULL},  0, 0,   DEC },
+    { "pixel_format", "set preferred pixel format",                                                 OFFSET(pixel_format),                   AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
+    { "input_format", "set preferred pixel format (for raw video) or codec name",                   OFFSET(pixel_format),                   AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
+    { "framerate",    "set frame rate",                                                             OFFSET(framerate),                      AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
+    { "no_buf_failsafe_threshold",  "exit after this amount of failed v4l2 buffer dequeue attempts",OFFSET(no_v4l2_buf_failsafe_threshold), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, DEC },
+    { "no_buf_failsafe_trigger",    "activate failsafe after specified valid frames amount",        OFFSET(no_v4l2_buf_failsafe_trigger),   AV_OPT_TYPE_INT, {.i64 = NO_V4L2_BUF_FAILESAFE_TRIGGER_DEFAULT }, 0, INT_MAX, DEC },
+    { "list_formats", "list available formats and exit",                                            OFFSET(list_format),                    AV_OPT_TYPE_INT,    {.i64 = 0 },  0, INT_MAX, DEC, "list_formats" },
+    { "all",          "show all available formats",                                                 OFFSET(list_format),                    AV_OPT_TYPE_CONST,  {.i64 = V4L_ALLFORMATS  },    0, INT_MAX, DEC, "list_formats" },
+    { "raw",          "show only non-compressed formats",                                           OFFSET(list_format),                    AV_OPT_TYPE_CONST,  {.i64 = V4L_RAWFORMATS  },    0, INT_MAX, DEC, "list_formats" },
+    { "compressed",   "show only compressed formats",                                               OFFSET(list_format),                    AV_OPT_TYPE_CONST,  {.i64 = V4L_COMPFORMATS },    0, INT_MAX, DEC, "list_formats" },
+    { "list_standards", "list supported standards and exit",                                        OFFSET(list_standard),                  AV_OPT_TYPE_INT,   {.i64 = 0 },  0, 1, DEC, "list_standards" },
+    { "all",            "show all supported standards",                                             OFFSET(list_standard),                  AV_OPT_TYPE_CONST, {.i64 = 1 },  0, 0, DEC, "list_standards" },
+    { "timestamps",   "set type of timestamps for grabbed frames",                                  OFFSET(ts_mode),                        AV_OPT_TYPE_INT,    {.i64 = 0 }, 0, 2, DEC, "timestamps" },
+    { "ts",           "set type of timestamps for grabbed frames",                                  OFFSET(ts_mode),                        AV_OPT_TYPE_INT,    {.i64 = 0 }, 0, 2, DEC, "timestamps" },
+    { "default",      "use timestamps from the kernel",                                             OFFSET(ts_mode),                        AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_DEFAULT  }, 0, 2, DEC, "timestamps" },
+    { "abs",          "use absolute timestamps (wall clock)",                                       OFFSET(ts_mode),                        AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_ABS      }, 0, 2, DEC, "timestamps" },
+    { "mono2abs",     "force conversion from monotonic to absolute timestamps",                     OFFSET(ts_mode),                        AV_OPT_TYPE_CONST,  {.i64 = V4L_TS_MONO2ABS }, 0, 2, DEC, "timestamps" },
+    { "use_libv4l2",  "use libv4l2 (v4l-utils) conversion functions",                               OFFSET(use_libv4l2),                    AV_OPT_TYPE_BOOL,   {.i64 = 0}, 0, 1, DEC },
     { NULL },
 };
 
